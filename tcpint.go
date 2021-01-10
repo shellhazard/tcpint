@@ -19,14 +19,13 @@ type Proxy struct {
 	log         *log.Entry
 	fromhandler func([]byte) []byte
 	tohandler   func([]byte) []byte
+	delimeter   byte
 }
 
-func NewProxy(from, to string, fromhandler, tohandler func([]byte) []byte) *Proxy {
+func NewProxy(from, to string, fromhandler, tohandler func([]byte) []byte, delimeter byte) *Proxy {
 	return &Proxy{
 		from: from,
 		to:   to,
-		// empty struct channel, anything in here makes this act
-		// used to close proxy
 		done: make(chan struct{}),
 		log: log.WithFields(log.Fields{
 			"from": from,
@@ -34,12 +33,13 @@ func NewProxy(from, to string, fromhandler, tohandler func([]byte) []byte) *Prox
 		}),
 		fromhandler: fromhandler,
 		tohandler:   tohandler,
+		delimeter:   delimeter,
 	}
 }
 
 // Start proxy server
 func (p *Proxy) Start() error {
-	p.log.Infoln("Starting proxy")
+	p.log.Infoln("Starting proxy on", p.from)
 	listener, err := net.Listen("tcp", p.from)
 	if err != nil {
 		return err
@@ -92,10 +92,10 @@ func (p *Proxy) handle(connection net.Conn) {
 	// Create a new waitgroup
 	wg := &sync.WaitGroup{}
 	wg.Add(2)
-	// Pushing data to client from remote host
-	go p.intercept(remote, connection, p.tohandler, wg)
 	// Pushing data from client to remote host
 	go p.intercept(connection, remote, p.fromhandler, wg)
+	// Pushing data to client from remote host
+	go p.intercept(remote, connection, p.tohandler, wg)
 	wg.Wait()
 }
 
@@ -110,7 +110,7 @@ func (p *Proxy) intercept(from, to net.Conn, fn func([]byte) []byte, wg *sync.Wa
 	default:
 		for {
 			// Read bytes up to delimeter
-			buf, err := r.ReadBytes(NULLBYTE)
+			buf, err := r.ReadBytes(p.delimeter)
 			if err != nil {
 				p.log.WithField("err", err).Errorln("Error from reader")
 				p.Stop()
