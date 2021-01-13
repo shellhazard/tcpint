@@ -13,20 +13,22 @@ const (
 )
 
 type Proxy struct {
-	from        string
-	to          string
-	done        chan struct{}
-	log         *log.Entry
-	fromhandler func([]byte) []byte
-	tohandler   func([]byte) []byte
-	delimeter   byte
+	from          string
+	to            string
+	done          chan struct{}
+	log           *log.Entry
+	clienthandler func([]byte) []byte
+	remotehandler func([]byte) []byte
+	delimeter     byte
 
 	// dynamic fields
+	clientinjector []byte
+	remoteinjector []byte
 
 	sync.Mutex
 }
 
-func NewProxy(from, to string, fromhandler, tohandler func([]byte) []byte, delimeter byte) *Proxy {
+func NewProxy(from, to string, clienthandler, remotehandler func([]byte) []byte, delimeter byte) *Proxy {
 	return &Proxy{
 		from: from,
 		to:   to,
@@ -35,28 +37,37 @@ func NewProxy(from, to string, fromhandler, tohandler func([]byte) []byte, delim
 			"from": from,
 			"to":   to,
 		}),
-		fromhandler:  fromhandler,
-		tohandler:    tohandler,
-		frominjector: []byte{},
-		toinjector:   []byte{},
-		delimeter:    delimeter,
+		clienthandler:  clienthandler,
+		remotehandler:  remotehandler,
+		clientinjector: []byte{},
+		remoteinjector: []byte{},
+		delimeter:      delimeter,
 	}
 }
 
+// Readers
+func (p *Proxy) Stopped() bool {
+	if p.done != nil {
+		return false
+	}
+	return true
+}
+
+// Writers
 func (p *Proxy) ToInject(b []byte) {
 	p.Lock()
 	defer p.Unlock()
 
-	r := append(p.toinjector, b...)
-	p.toinjector = r
+	r := append(p.remoteinjector, b...)
+	p.remoteinjector = r
 }
 
 func (p *Proxy) FromInject(b []byte) {
 	p.Lock()
 	defer p.Unlock()
 
-	r := append(p.frominjector, b...)
-	p.frominjector = r
+	r := append(p.clientinjector, b...)
+	p.clientinjector = r
 }
 
 // Start proxy server
@@ -115,23 +126,40 @@ func (p *Proxy) handle(connection net.Conn) {
 	wg := &sync.WaitGroup{}
 	wg.Add(2)
 	// Pushing data from client to remote host
-	go p.intercept(connection, remote, p.fromhandler, *p.frominjector, wg)
+	go p.intercept(connection, remote, "client", wg)
 	// Pushing data to client from remote host
-	go p.intercept(remote, connection, p.tohandler, *p.toinjector, wg)
+	go p.intercept(remote, connection, "remote", wg)
 	wg.Wait()
 }
 
-func (p *Proxy) intercept(from, to net.Conn, fn func([]byte) []byte, injector *[]byte, wg *sync.WaitGroup) {
+// fn func([]byte) []byte, injector []byte
+func (p *Proxy) intercept(from, to net.Conn, readertype string, wg *sync.WaitGroup) {
 	defer wg.Done()
 	// Create reader
 	r := bufio.NewReader(from)
-	select {
-	// If our proxy is stopped, return
-	case <-p.done:
-		break
-	default:
-		for {
+
+	// Set parameters
+	var (
+		fn       func([]byte) []byte
+		injector []byte
+	)
+	switch readertype {
+	case "client":
+		fn = p.clienthandler
+		injector = p.clientinjector
+	case "remote":
+		fn = p.remotehandler
+		injector = p.remoteinjector
+	}
+
+	for {
+		select {
+		// If our proxy is stopped, return
+		case <-p.done:
+			break
+		default:
 			var buf []byte
+			var err error
 
 			// Read injected bytes
 			if len(injector) > 0 {
@@ -139,6 +167,14 @@ func (p *Proxy) intercept(from, to net.Conn, fn func([]byte) []byte, injector *[
 				_ = copy(buf, injector)
 				injector = nil
 				p.Unlock()
+				// Write injected bytes
+				_, err = to.Write(buf)
+				if err != nil {
+					p.log.WithField("err", err).Errorln("Error writing injected bytes")
+					p.Stop()
+					break
+				}
+				buf = nil
 			}
 
 			// Read bytes up to delimeter
