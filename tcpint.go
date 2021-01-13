@@ -188,12 +188,14 @@ func (p *Proxy) intercept(from, to net.Conn, readertype string, wg *sync.WaitGro
 			// Run process function
 			modbuf := fn(buf)
 
-			// Write bytes to other side
-			_, err = to.Write(modbuf)
-			if err != nil {
-				p.log.WithField("err", err).Errorln("Error writing")
-				p.Stop()
-				break
+			if len(modbuf) > 0 {
+				// Write bytes to other side
+				_, err = to.Write(modbuf)
+				if err != nil {
+					p.log.WithField("err", err).Errorln("Error writing")
+					p.Stop()
+					break
+				}
 			}
 		}
 	}
