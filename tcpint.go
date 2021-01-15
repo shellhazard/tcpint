@@ -54,7 +54,7 @@ func (p *Proxy) Stopped() bool {
 }
 
 // Writers
-func (p *Proxy) ToInject(b []byte) {
+func (p *Proxy) RemoteInject(b []byte) {
 	p.Lock()
 	defer p.Unlock()
 
@@ -62,12 +62,24 @@ func (p *Proxy) ToInject(b []byte) {
 	p.remoteinjector = r
 }
 
-func (p *Proxy) FromInject(b []byte) {
+func (p *Proxy) ClientInject(b []byte) {
 	p.Lock()
 	defer p.Unlock()
 
 	r := append(p.clientinjector, b...)
 	p.clientinjector = r
+}
+
+func (p *Proxy) ClearInject(writertype string) {
+	p.Lock()
+	defer p.Unlock()
+
+	switch writertype {
+	case "remote":
+		p.remoteinjector = nil
+	default: // "client"
+		p.clientinjector = nil
+	}
 }
 
 // Start proxy server
@@ -126,53 +138,61 @@ func (p *Proxy) handle(connection net.Conn) {
 	wg := &sync.WaitGroup{}
 	wg.Add(2)
 	// Pushing data from client to remote host
-	go p.intercept(connection, remote, "client", wg)
+	go p.intercept(connection, remote, "client", "remote", wg)
 	// Pushing data to client from remote host
-	go p.intercept(remote, connection, "remote", wg)
+	go p.intercept(remote, connection, "remote", "client", wg)
 	wg.Wait()
 }
 
 // fn func([]byte) []byte, injector []byte
-func (p *Proxy) intercept(from, to net.Conn, readertype string, wg *sync.WaitGroup) {
+func (p *Proxy) intercept(from, to net.Conn, readertype string, writertype string, wg *sync.WaitGroup) {
 	defer wg.Done()
 	// Create reader
 	r := bufio.NewReader(from)
 
 	// Set parameters
-	var (
-		fn       func([]byte) []byte
-		injector []byte
-	)
+	var fn func([]byte) []byte
 	switch readertype {
-	case "client":
-		fn = p.clienthandler
-		injector = p.clientinjector
 	case "remote":
 		fn = p.remotehandler
-		injector = p.remoteinjector
+	default: // "client"
+		fn = p.clienthandler
 	}
 
-	for {
-		select {
-		// If our proxy is stopped, return
-		case <-p.done:
-			break
-		default:
+	select {
+	// If our proxy is stopped, return
+	case <-p.done:
+		return
+	default:
+		for {
 			var buf []byte
 			var err error
+			var injector []byte
 
-			// Read injected bytes
+			// Get injected bytes
+			p.Lock()
+			switch writertype {
+			case "remote":
+				injector = p.remoteinjector
+			default: // "client"
+				injector = p.clientinjector
+			}
+			p.Unlock()
+
 			if len(injector) > 0 {
-				p.Lock()
-				_ = copy(buf, injector)
-				injector = nil
-				p.Unlock()
+				// Read injected bytes
+				p.log.WithField("data", injector).Infoln("Found injected bytes")
+				injectbuf := make([]byte, len(injector))
+				_ = copy(injectbuf, injector)
+				p.ClearInject(writertype)
+
 				// Write injected bytes
-				_, err = to.Write(buf)
+				p.log.WithField("data", injectbuf).Infoln("Writing injected bytes")
+				_, err = to.Write(injectbuf)
 				if err != nil {
 					p.log.WithField("err", err).Errorln("Error writing injected bytes")
 					p.Stop()
-					break
+					return
 				}
 				buf = nil
 			}
@@ -182,7 +202,7 @@ func (p *Proxy) intercept(from, to net.Conn, readertype string, wg *sync.WaitGro
 			if err != nil {
 				p.log.WithField("err", err).Errorln("Error from reader")
 				p.Stop()
-				break
+				return
 			}
 
 			// Run process function
@@ -194,7 +214,7 @@ func (p *Proxy) intercept(from, to net.Conn, readertype string, wg *sync.WaitGro
 				if err != nil {
 					p.log.WithField("err", err).Errorln("Error writing")
 					p.Stop()
-					break
+					return
 				}
 			}
 		}
