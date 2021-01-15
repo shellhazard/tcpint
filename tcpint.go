@@ -28,6 +28,12 @@ type Proxy struct {
 	sync.Mutex
 }
 
+type SafeConn struct {
+	net.Conn
+
+	sync.Mutex
+}
+
 func NewProxy(from, to string, clienthandler, remotehandler func([]byte) []byte, delimeter byte) *Proxy {
 	return &Proxy{
 		from: from,
@@ -45,6 +51,12 @@ func NewProxy(from, to string, clienthandler, remotehandler func([]byte) []byte,
 	}
 }
 
+func NewSafeConn(conn net.Conn) *SafeConn {
+	return &SafeConn{
+		Conn: conn,
+	}
+}
+
 // Readers
 func (p *Proxy) Stopped() bool {
 	if p.done != nil {
@@ -54,20 +66,17 @@ func (p *Proxy) Stopped() bool {
 }
 
 // Writers
-func (p *Proxy) RemoteInject(b []byte) {
-	p.Lock()
-	defer p.Unlock()
+func (p *Proxy) Inject(writertype string, b []byte) {
+	var r []byte
 
-	r := append(p.remoteinjector, b...)
-	p.remoteinjector = r
-}
-
-func (p *Proxy) ClientInject(b []byte) {
-	p.Lock()
-	defer p.Unlock()
-
-	r := append(p.clientinjector, b...)
-	p.clientinjector = r
+	switch writertype {
+	case "remote":
+		r = append(p.remoteinjector, b...)
+		p.remoteinjector = r
+	default: // "client"
+		r = append(p.clientinjector, b...)
+		p.clientinjector = r
+	}
 }
 
 func (p *Proxy) ClearInject(writertype string) {
@@ -134,38 +143,25 @@ func (p *Proxy) handle(connection net.Conn) {
 		return
 	}
 	defer remote.Close()
+	// Wrap net.Conn in SafeConn to provide mutex support
+	safeconnection := NewSafeConn(connection)
+	saferemote := NewSafeConn(remote)
 	// Create a new waitgroup
 	wg := &sync.WaitGroup{}
 	wg.Add(2)
 	// Pushing data from client to remote host
-	go p.intercept(connection, remote, "client", "remote", wg)
+	go p.intercept(safeconnection, saferemote, "client", "remote", wg)
 	// Pushing data to client from remote host
-	go p.intercept(remote, connection, "remote", "client", wg)
+	go p.intercept(saferemote, safeconnection, "remote", "client", wg)
 	wg.Wait()
 }
 
-// fn func([]byte) []byte, injector []byte
-func (p *Proxy) intercept(from, to net.Conn, readertype string, writertype string, wg *sync.WaitGroup) {
-	defer wg.Done()
-	// Create reader
-	r := bufio.NewReader(from)
-
-	// Set parameters
-	var fn func([]byte) []byte
-	switch readertype {
-	case "remote":
-		fn = p.remotehandler
-	default: // "client"
-		fn = p.clienthandler
-	}
-
+func (p *Proxy) processinjection(to *SafeConn, writertype string) {
 	select {
-	// If our proxy is stopped, return
 	case <-p.done:
 		return
 	default:
 		for {
-			var buf []byte
 			var err error
 			var injector []byte
 
@@ -187,15 +183,47 @@ func (p *Proxy) intercept(from, to net.Conn, readertype string, writertype strin
 				p.ClearInject(writertype)
 
 				// Write injected bytes
+				to.Lock()
 				p.log.WithField("data", injectbuf).Infoln("Writing injected bytes")
 				_, err = to.Write(injectbuf)
 				if err != nil {
+					to.Unlock()
 					p.log.WithField("err", err).Errorln("Error writing injected bytes")
 					p.Stop()
 					return
 				}
-				buf = nil
+				to.Unlock()
 			}
+		}
+	}
+}
+
+// fn func([]byte) []byte, injector []byte
+func (p *Proxy) intercept(from, to *SafeConn, readertype string, writertype string, wg *sync.WaitGroup) {
+	defer wg.Done()
+	// Create reader
+	r := bufio.NewReader(from)
+
+	// Set parameters
+	var fn func([]byte) []byte
+	switch readertype {
+	case "remote":
+		fn = p.remotehandler
+	default: // "client"
+		fn = p.clienthandler
+	}
+
+	// Start injection loop
+	go p.processinjection(to, writertype)
+
+	select {
+	// If our proxy is stopped, return
+	case <-p.done:
+		return
+	default:
+		for {
+			var buf []byte
+			var err error
 
 			// Read bytes up to delimeter
 			buf, err = r.ReadBytes(p.delimeter)
@@ -206,17 +234,22 @@ func (p *Proxy) intercept(from, to net.Conn, readertype string, writertype strin
 			}
 
 			// Run process function
+			to.Lock()
+
 			modbuf := fn(buf)
 
 			if len(modbuf) > 0 {
 				// Write bytes to other side
 				_, err = to.Write(modbuf)
 				if err != nil {
+					to.Unlock()
 					p.log.WithField("err", err).Errorln("Error writing")
 					p.Stop()
 					return
 				}
 			}
+
+			to.Unlock()
 		}
 	}
 }
