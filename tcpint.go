@@ -69,13 +69,15 @@ func (p *Proxy) Stopped() bool {
 func (p *Proxy) Inject(writertype string, b []byte) {
 	var r []byte
 
-	switch writertype {
-	case "remote":
-		r = append(p.remoteinjector, b...)
-		p.remoteinjector = r
-	default: // "client"
-		r = append(p.clientinjector, b...)
-		p.clientinjector = r
+	if len(b) > 0 {
+		switch writertype {
+		case "remote":
+			r = append(p.remoteinjector, b...)
+			p.remoteinjector = r
+		default: // "client"
+			r = append(p.clientinjector, b...)
+			p.clientinjector = r
+		}
 	}
 }
 
