@@ -9,7 +9,7 @@ package main
 import (
 	"fmt"
 
-	"github.com/unva1idated/tcpint"
+	"github.com/shellhazard/tcpint"
 )
 
 const (
